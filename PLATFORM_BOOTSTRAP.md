@@ -99,7 +99,7 @@ git clone https://github.com/<YOUR_GITHUB_USERNAME>/pharmops-gitops.git
 
 ## 2. What You Need to Customise
 
-After Terraform runs (Step 1), replace these three placeholders across the pharmops-gitops repo before deploying.
+After Terraform runs (Step 1), replace these four placeholders across the pharmops-gitops repo before deploying.
 
 ### 2.1 `<AWS_ACCOUNT_ID>` → Your 12-digit AWS account ID
 
@@ -147,6 +147,28 @@ Quick replace:
 GITHUB_USERNAME="<your-github-username>"
 find argocd -name "*.yaml" -exec \
   sed -i "s/<YOUR_GITHUB_USERNAME>/$GITHUB_USERNAME/g" {} \;
+```
+
+### 2.4 `<YOUR_ALB_HOSTNAME>` → Your nginx ingress ALB hostname
+
+After Step 3 (installing the nginx ingress controller), get your ALB hostname:
+```bash
+kubectl get svc ingress-nginx-controller -n ingress-nginx \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}'
+```
+
+Files to update:
+
+| File | What it sets |
+|------|-------------|
+| `envs/dev/values-api-gateway.yaml` | Ingress host for API routing |
+| `k8s-manifests/pharma-ui/ingress.yaml` | Ingress host for UI |
+
+Quick replace:
+```bash
+ALB_HOSTNAME="<your-alb-hostname>"
+sed -i "s/<YOUR_ALB_HOSTNAME>/$ALB_HOSTNAME/g" envs/dev/values-api-gateway.yaml
+sed -i "s/<YOUR_ALB_HOSTNAME>/$ALB_HOSTNAME/g" k8s-manifests/pharma-ui/ingress.yaml
 ```
 
 Commit and push these changes before proceeding to Step 7.
@@ -250,7 +272,7 @@ aws eks describe-cluster --name pharma-dev-cluster --query 'cluster.status' --ou
 
 # ECR repositories exist
 aws ecr describe-repositories --query 'repositories[].repositoryName' --output table
-# Expected: api-gateway, auth-service, drug-catalog-service, notification-service, pharma-ui
+# Expected: api-gateway, auth-service, catalog-service, notification-service, pharma-ui
 
 # Secrets exist
 aws secretsmanager list-secrets --query 'SecretList[].Name' --output table
@@ -426,9 +448,9 @@ docker buildx build --platform linux/amd64 \
 docker buildx build --platform linux/amd64 \
   -t ${REGISTRY}/auth-service:${IMAGE_TAG} --push services/auth-service
 
-# drug-catalog-service
+# catalog-service (ECR repo name is catalog-service, directory is drug-catalog-service)
 docker buildx build --platform linux/amd64 \
-  -t ${REGISTRY}/drug-catalog-service:${IMAGE_TAG} --push services/drug-catalog-service
+  -t ${REGISTRY}/catalog-service:${IMAGE_TAG} --push services/drug-catalog-service
 
 # notification-service
 docker buildx build --platform linux/amd64 \
@@ -441,14 +463,14 @@ docker buildx build --platform linux/amd64 \
   -t ${REGISTRY}/pharma-ui:${IMAGE_TAG} --push services/pharma-ui
 ```
 
-> **ECR repository names must match exactly:** `api-gateway`, `auth-service`, `drug-catalog-service`, `notification-service`, `pharma-ui`. If Terraform created different names, update the `repository` field in the corresponding `envs/dev/values-*.yaml` file.
+> **ECR repository names must match exactly:** `api-gateway`, `auth-service`, `catalog-service`, `notification-service`, `pharma-ui`. Note: the source directory is `drug-catalog-service` but the ECR repo and image name is `catalog-service`. If Terraform created different names, update the `repository` field in the corresponding `envs/dev/values-*.yaml` file.
 
 ---
 
 ### ✅ Validation — Step 5
 
 ```bash
-for repo in api-gateway auth-service drug-catalog-service notification-service pharma-ui; do
+for repo in api-gateway auth-service catalog-service notification-service pharma-ui; do
   echo -n "$repo: "
   aws ecr describe-images --repository-name $repo \
     --query 'imageDetails[0].imageTags[0]' --output text 2>/dev/null || echo "NOT FOUND"
@@ -492,12 +514,12 @@ git push
 ```bash
 cd pharmops-gitops
 
-# Login to ArgoCD
-kubectl port-forward svc/argocd-server -n argocd 8080:443 &
+# Login to ArgoCD (use port 8090 to avoid conflict with other local services)
+kubectl port-forward svc/argocd-server -n argocd 8090:443 &
 sleep 3
 ARGOCD_PASSWORD=$(kubectl get secret argocd-initial-admin-secret \
   -n argocd -o jsonpath='{.data.password}' | base64 -d)
-argocd login localhost:8080 --insecure --username admin --password $ARGOCD_PASSWORD
+argocd login localhost:8090 --insecure --username admin --password $ARGOCD_PASSWORD
 
 # Apply project and RBAC
 kubectl apply -f argocd/projects/pharma-project.yaml
@@ -506,11 +528,11 @@ kubectl apply -f k8s/rbac/dev-role.yaml
 kubectl apply -f k8s/rbac/rolebindings.yaml
 
 # Apply ArgoCD Applications (one per service)
-kubectl apply -f argocd/apps/dev/api-gateway/application.yaml
-kubectl apply -f argocd/apps/dev/auth-service/application.yaml
-kubectl apply -f argocd/apps/dev/catalog-service/application.yaml
-kubectl apply -f argocd/apps/dev/notification-service/application.yaml
-kubectl apply -f argocd/apps/dev/pharma-ui/application.yaml
+kubectl apply -f argocd/apps/dev/api-gateway-app.yaml
+kubectl apply -f argocd/apps/dev/auth-service-app.yaml
+kubectl apply -f argocd/apps/dev/catalog-service-app.yaml
+kubectl apply -f argocd/apps/dev/notification-service-app.yaml
+kubectl apply -f argocd/apps/dev/pharma-ui-app.yaml
 ```
 
 ArgoCD will automatically sync and deploy all services. Watch the rollout:
@@ -538,10 +560,10 @@ source:
 
 ### ArgoCD UI
 
+ArgoCD is accessed via port-forward (not exposed through the ALB):
 ```bash
-# Port-forward (if not already running)
-kubectl port-forward svc/argocd-server -n argocd 8080:443 &
-# Open: https://localhost:8080
+kubectl port-forward svc/argocd-server -n argocd 8090:443 &
+# Open: https://localhost:8090
 # Username: admin  |  Password: (from Step 3)
 ```
 
@@ -551,7 +573,7 @@ kubectl port-forward svc/argocd-server -n argocd 8080:443 &
 
 ```bash
 # All 5 ArgoCD applications Synced
-argocd app list --server localhost:8080 --insecure
+argocd app list --server localhost:8090 --insecure
 # Expected: 5 apps with Sync Status=Synced, Health=Healthy
 
 # All 5 pods Running in dev namespace
@@ -572,10 +594,14 @@ kubectl get pods -n dev
 
 ### Access the UI
 
+Get your ALB hostname and open it in the browser:
 ```bash
-kubectl port-forward svc/pharma-ui -n dev 8081:80
-# Open: http://localhost:8081
+ALB=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+echo "http://${ALB}"
 ```
+
+Open `http://<YOUR_ALB_HOSTNAME>` in your browser.
 
 ### Login Credentials
 
@@ -589,27 +615,27 @@ kubectl port-forward svc/pharma-ui -n dev 8081:80
 ### API Tests
 
 ```bash
-# Port-forward API gateway for direct testing
-kubectl port-forward svc/api-gateway -n dev 8082:8080 &
+ALB=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
 
 # 1. Login and get JWT token
-TOKEN=$(curl -s -X POST http://localhost:8082/api/auth/login \
+TOKEN=$(curl -s -X POST http://${ALB}/api/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"changeme"}' \
   | grep -o 'eyJ[^"]*')
 echo "Token: ${TOKEN:0:50}..."
 
 # 2. Drug catalog (reads from RDS database)
-curl -s http://localhost:8082/api/drugs \
+curl -s http://${ALB}/api/drugs \
   -H "Authorization: Bearer $TOKEN" | python3 -m json.tool
 
 # 3. Protected route blocked without token
 curl -s -o /dev/null -w "Status without token: %{http_code}\n" \
-  http://localhost:8082/api/drugs
+  http://${ALB}/api/drugs
 # Expected: 401
 
 # 4. Health checks
-curl -s http://localhost:8082/api/auth/actuator/health
+curl -s http://${ALB}/api/auth/actuator/health
 # Expected: {"status":"UP",...}
 ```
 
@@ -618,17 +644,20 @@ curl -s http://localhost:8082/api/auth/actuator/health
 ### ✅ Final Validation
 
 ```bash
+ALB=$(kubectl get svc ingress-nginx-controller -n ingress-nginx \
+  -o jsonpath='{.status.loadBalancer.ingress[0].hostname}')
+
 # Login returns a JWT token
-curl -s -X POST http://localhost:8081/api/auth/login \
+curl -s -X POST http://${ALB}/api/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"changeme"}'
 # Expected: {"token":"eyJ...","username":"admin","role":"ADMIN"}
 
 # Drug catalog returns seeded data (8 drugs)
-TOKEN=$(curl -s -X POST http://localhost:8081/api/auth/login \
+TOKEN=$(curl -s -X POST http://${ALB}/api/auth/login \
   -H 'Content-Type: application/json' \
   -d '{"username":"admin","password":"changeme"}' | grep -o 'eyJ[^"]*')
-curl -s http://localhost:8081/api/drugs -H "Authorization: Bearer $TOKEN"
+curl -s http://${ALB}/api/drugs -H "Authorization: Bearer $TOKEN"
 # Expected: JSON array with drugs — Crocin, Augmentin, Brufen, etc.
 
 # All pods healthy
@@ -636,7 +665,7 @@ kubectl get pods -n dev
 # Expected: all 5 pods Running, 0 CrashLoopBackOff
 
 # ArgoCD all apps Healthy
-argocd app list --server localhost:8080 --insecure
+argocd app list --server localhost:8090 --insecure
 # Expected: all Sync=Synced, Health=Healthy
 ```
 
@@ -669,25 +698,29 @@ t3.small nodes have a maximum of **11 pods per node**. If you have many system p
 ### ArgoCD shows OutOfSync
 
 ```bash
-argocd app sync <app-name> --server localhost:8080 --insecure
+argocd app sync <app-name> --server localhost:8090 --insecure
 ```
 
 If still OutOfSync, check for Helm rendering errors:
 ```bash
-argocd app diff <app-name> --server localhost:8080 --insecure
+argocd app diff <app-name> --server localhost:8090 --insecure
 ```
 
 ### Login page shows network error in browser
 
-The React app sends API requests to `/api/...` (relative path), which nginx proxies to `api-gateway`. Verify the env var was baked in at image build time:
+The React app uses `/api` as the base URL (relative path), which the ALB routes to `api-gateway`. Verify the correct URL is baked into the built image:
 
 ```bash
 kubectl exec -n dev deployment/pharma-ui -- \
   grep -c 'localhost:8080' /usr/share/nginx/html/static/js/main.*.js
-# Expected: 0  (if it shows 1, the image was built without .env.production)
+# Expected: 0  (if it shows 1, the image was built from old source code)
 ```
 
-If it shows 1, rebuild the pharma-ui image — ensure `services/pharma-ui/.env.production` exists with `REACT_APP_API_URL=/api`.
+If it shows 1, rebuild the pharma-ui image — ensure `services/pharma-ui/src/services/api.js` has:
+```js
+baseURL: process.env.REACT_APP_API_URL || '/api',
+```
+Then rebuild with `--platform linux/amd64` and push to ECR.
 
 ### External Secrets not syncing
 
@@ -718,24 +751,26 @@ argocd login localhost:8090 --insecure ...
 ## Architecture Reference
 
 ```
-Browser (http://localhost:8081)
+Browser (http://<YOUR_ALB_HOSTNAME>)
   │
   ▼
-pharma-ui (nginx, port 80)
-  │  /api/*  →  proxy to api-gateway:8080
-  │  /*      →  serve React SPA (index.html)
+AWS ELB (nginx ingress controller)
+  │  /     →  pharma-ui service
+  │  /api  →  api-gateway service
   │
-  ▼
-api-gateway (Spring Cloud Gateway, port 8080)
-  │  /api/auth/**          →  auth-service:8081
-  │  /api/drugs/**         →  drug-catalog-service:8082
-  │                            (path rewritten to /api/drug/catalog/*)
-  │  /api/notifications/** →  notification-service:3000
-  │  /api/inventory, etc.  →  MockDataController (stub — no backend service)
+  ├─▶ pharma-ui (nginx, port 80)
+  │     /*  →  serve React SPA (index.html)
   │
-  ├─▶ auth-service (port 8081)          ─▶ RDS (schema: auth)
-  ├─▶ drug-catalog-service (port 8082)  ─▶ RDS (schema: drug_catalog)
-  └─▶ notification-service (port 3000)
+  └─▶ api-gateway (Spring Cloud Gateway, port 8080)
+        │  /api/auth/**          →  auth-service:8081
+        │  /api/drugs/**         →  drug-catalog-service:8082
+        │                            (path rewritten to /api/drug/catalog/*)
+        │  /api/notifications/** →  notification-service:3000
+        │  /api/inventory, etc.  →  MockDataController (stub — no backend service)
+        │
+        ├─▶ auth-service (port 8081)          ─▶ RDS (schema: auth)
+        ├─▶ drug-catalog-service (port 8082)  ─▶ RDS (schema: drug_catalog)
+        └─▶ notification-service (port 3000)
 ```
 
 ### Service Name Reference
